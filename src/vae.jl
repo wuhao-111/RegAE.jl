@@ -1,160 +1,267 @@
-const F = Float32
+using BSON
+using CUDA
+using DrWatson: struct2dict
+using Flux
+using Flux: @functor, chunk
+#using Flux.Losses: logitbinarycrossentropy
+using Flux.Losses: binarycrossentropy
+using Flux.Data: DataLoader
+using Images
+using Logging: with_logger
+using MLDatasets
+using Parameters: @with_kw
+using ProgressMeter: Progress, next!
+using TensorBoardLogger: TBLogger, tb_overwrite
+using Random
+using PyPlot
+#device!(1)
+import Statistics
+
+#include("ex_dan.jl")
+
+#filename="trainingdata.jld2"
+#variablename="allloghycos"
 
 function loaddata(filename, variablename)
-    data = load(filename, variablename)
-    numpixels = size(data, 2)
-    xtrn = Array{Float32}(undef, numpixels, numpixels, 1, div(8 * size(data, 1), 10))
-    ytrn = ones(Float32, div(8 * size(data, 1), 10))
-    xtst = Array{Float32}(undef, numpixels, numpixels, 1, size(data, 1) - div(8 * size(data, 1), 10))
-    ytst = ones(Float32, size(data, 1) - div(8 * size(data, 1), 10))
-    lowend = minimum(data)
-    highend = maximum(data)
-    for i = 1:size(xtrn, 4)
-        xtrn[:, :, 1, i] = (data[i, :, :] .- lowend) ./ (highend - lowend)
-    end
-    for i = 1:size(xtst, 4)
-        xtst[:, :, 1, i] = (data[i + div(8 * size(data, 1), 10), :, :] .- lowend) ./ (highend - lowend)
-    end
-    return xtrn, ytrn, xtst, ytst, highend, lowend
+	data = load(filename, variablename)
+	numpixels = size(data, 2)
+	xtrn = Array{Float32}(undef, numpixels, numpixels, 1, div(8 * size(data, 1), 10))
+	ytrn = ones(Float32, div(8 * size(data, 1), 10))
+        xtst = Array{Float32}(undef, numpixels, numpixels, 1, size(data, 1) - div(8 * size(data, 1), 10))
+	ytst = ones(Float32, size(data, 1) - div(8 * size(data, 1), 10))
+	lowend = minimum(data)
+	highend = maximum(data)
+	for i = 1:size(xtrn, 4)
+        	xtrn[:, :, 1, i] = (data[i, :, :] .- lowend) ./ (highend - lowend)
+    	end
+    	for i = 1:size(xtst, 4)
+        	xtst[:, :, 1, i] = (data[i + div(8 * size(data, 1), 10), :, :] .- lowend) ./ (highend - lowend)
+    	end
+    	return xtrn, ytrn, xtst, ytst, highend, lowend
 end
 
-function encode(ϕ, x)
-    x = mat(x)
-    x = relu.(ϕ[1]*x .+ ϕ[2])
-    μ = ϕ[3]*x .+ ϕ[4]
-    logσ² = ϕ[5]*x .+ ϕ[6]
-    return μ, logσ²
+# load perm images and return loader
+function get_data(batch_size,filename,variablename)
+    xtrn, ytrn, xtst, ytst, highend, lowend  = loaddata(filename, variablename)
+    xtrn = reshape(xtrn, 100^2, :)
+    xtrain = xtrn
+    ytrain = ytrn
+    DataLoader((xtrain, ytrain), batchsize=batch_size, shuffle=true)
 end
 
-function decode(θ, z)
-    z = relu.(θ[1]*z .+ θ[2])
-    return sigm.(θ[3]*z .+ θ[4])
+function get_data2(batch_size,filename,variablename)
+    xtrn, ytrn, xtst, ytst, highend, lowend  = loaddata(filename, variablename)
+    xtst = reshape(xtst, 100^2, :)
+    xtest = xtst
+    ytest = ytst
+    DataLoader((xtest, ytest), batchsize=batch_size, shuffle=true)
 end
 
+function findrange(filename, variablename)
+    xtrn, ytrn, xtst, ytst, highend, lowend  = loaddata(filename, variablename)
+    return highend, lowend 
+end
+
+struct Encoder
+    linear
+    μ
+    logσ
+end
+@functor Encoder
+
+Encoder(input_dim::Int, latent_dim::Int, hidden_dim::Int) = Encoder(
+    Dense(input_dim, hidden_dim, tanh),   # linear
+    Dense(hidden_dim, latent_dim),        # μ
+    Dense(hidden_dim, latent_dim),        # logσ
+)
+
+function (encoder::Encoder)(x)
+    h = encoder.linear(x)
+    encoder.μ(h), encoder.logσ(h)
+end
+
+Decoder(input_dim::Int, latent_dim::Int, hidden_dim::Int) = Chain(
+    Dense(latent_dim, hidden_dim, tanh),
+    Dense(hidden_dim, input_dim, sigmoid)
+    #Dense(hidden_dim, input_dim)
+)
+
+
+function reconstuct(encoder, decoder, x, device)
+    μ, logσ = encoder(x)
+    z = μ + device(randn(Float32, size(logσ))) .* exp.(logσ)
+    μ, logσ, decoder(z)
+end
+
+const F = Float32
 function binary_cross_entropy(x, x̂)
     s = @. x * log(x̂ + F(1e-10)) + (1-x) * log(1 - x̂ + F(1e-10))
-    return -mean(s)
+    return -s
+    #return -mean(s)
 end
 
-function loss(w, x, nθ)
-    θ, ϕ = w[1:nθ], w[nθ+1:end]
-    μ, logσ² = encode(ϕ, x)
-    nz, M = size(μ)
-    σ² = exp.(logσ²)
-    σ = sqrt.(σ²)
+function model_loss(encoder, decoder, decoder_params, λ, x, device)
+    μ, logσ, decoder_z = reconstuct(encoder, decoder, x, device)
+    len = size(x)[end]
+    # KL-divergence
+    kl_q_p = 0.5f0 * sum(@. (exp(2f0 * logσ) + μ^2 -1f0 - 2f0 * logσ)) / len
 
-    KL =  -sum(@. 1 + logσ² - μ*μ - σ²) / 2
-    # Normalise by same number of elements as in reconstruction
-    KL /= M*size(x,1)*size(x,1)
+    #logp_x_z = binary_cross_entropy(x, decoder_z)/len 
+    #logp_x_z = -logitbinarycrossentropy(decoder_z, x, agg=sum) / len
+    logp_x_z = -binarycrossentropy(decoder_z, x, agg=sum) / len
+    # regularization
+    #reg = λ * sum(x->sum(x.^2), Flux.params(decoder))
+    reg = λ * sum(x->sum(x.^2), decoder_params)
 
-    z = μ .+ randn!(similar(μ)) .* σ
-    x̂ = decode(θ, z)
-    BCE = binary_cross_entropy(mat(x), x̂)
-
-    return BCE + KL
+    -logp_x_z + kl_q_p + reg
 end
 
-function aveloss(θ, ϕ, data)
-    ls = F(0)
-    nθ = length(θ)
-    for (x, y) in data
-        ls += loss([θ; ϕ], x, nθ)
+
+#### images plot
+function convert_to_image(x, y_size)
+    Gray.(permutedims(vcat(reshape.(chunk(x |> cpu, y_size), 100, :)...), (2, 1)))
+end
+
+#Arguments for the `train` function
+@with_kw mutable struct Args
+    η = 1e-4                # learning rate
+    λ = 0.0001f0              # regularization paramater
+    batch_size = 100        # batch size
+    sample_size = 4        # sampling size for output
+    #epochs = 1             # number of epochs
+    #seed = 0                # random seed
+    cuda = true             # use GPU
+    input_dim = 100^2        # image size
+    #latent_dim = 100          # latent dimension
+    #hidden_dim = 500        # hidden dimension
+    verbose_freq = 10       # logging for every verbose_freq iterations
+    tblogger = false        # log training with tensorboard
+    save_path = "output"    # results path
+end
+
+function train(filename, variablename, epochs, seed, latent_dim, hidden_dim; kws...)
+    # load hyperparamters
+    args = Args(; kws...)
+    seed > 0 && Random.seed!(seed)
+
+    # GPU config
+    if args.cuda && CUDA.has_cuda()
+        device = gpu
+        @info "Training on GPU"
+    else
+        device = cpu
+        @info "Training on CPU"
     end
-    return ls / length(data)
-end
 
-function train!(θ, ϕ, data, opt; epochs=1)
-    w = [θ; ϕ]
-    for epoch=1:epochs
-        for (x, y) in data
-            dw = grad(loss)(w, x, length(θ))
-            update!(w, dw, opt)
+    # load train data
+    loader = get_data(args.batch_size,filename,variablename)
+    loader2 = get_data2(args.batch_size,filename,variablename)
+
+    # initialize encoder and decoder
+    encoder = Encoder(args.input_dim, latent_dim, hidden_dim) |> device
+    decoder = Decoder(args.input_dim, latent_dim, hidden_dim) |> device
+
+    # ADAM optimizer
+    opt = ADAM(args.η)
+   
+    # parameters
+    ps = Flux.params(encoder.linear, encoder.μ, encoder.logσ, decoder)
+
+    #!ispath(args.save_path) && mkpath(args.save_path)
+
+    # logging by TensorBoard.jl
+    if args.tblogger 
+        tblogger = TBLogger(args.save_path, tb_overwrite)
+    end
+    
+    # input plot
+    original, _ = first(get_data(args.sample_size,filename,variablename))
+    original = original |> device
+    image = convert_to_image(original, args.sample_size)
+    image_path = joinpath(args.save_path, "original.png")
+    save(image_path, image)
+    @info "Image saved: $(image_path)"
+
+    original2, _ = first(get_data2(args.sample_size,filename,variablename))
+    original2 = original2 |> device
+    image = convert_to_image(original2, args.sample_size)
+    image_path = joinpath(args.save_path, "original2.png")
+    save(image_path, image)
+    @info "Image saved: $(image_path)"
+    
+    # training
+    train_steps = 0
+    @info "Start Training, total $(epochs) epochs"
+    decoder_params = Flux.params(decoder)
+    for epoch = 1:epochs
+        @info "Epoch $(epoch)"
+        progress = Progress(length(loader))
+
+        for (x,_) in loader
+            loss, back = Flux.pullback(ps) do
+                model_loss(encoder, decoder, decoder_params, args.λ, x |> device, device)
+            end
+            grad = back(1f0)
+            Flux.Optimise.update!(opt, ps, grad)
+            # progress meter
+            next!(progress; showvalues=[(:loss, loss)])
+
+            # logging with TensorBoard
+            if args.tblogger && train_steps % args.verbose_freq == 0
+                with_logger(tblogger) do
+                    @info "train" loss=loss
+                end
+            end
+
+            train_steps += 1
         end
+
     end
-    return θ, ϕ
+    # save model
+    highend, lowend = findrange(filename, variablename)
+
+    model_path = joinpath(args.save_path, "model.bson")
+    let encoder = cpu(encoder), decoder = cpu(decoder), args=struct2dict(args)
+        BSON.@save model_path encoder decoder args #highend lowend 
+        @info "Model saved: $(model_path)"
+    end
+    _, _, rec_original = reconstuct(encoder, decoder, original, device)
+    #rec_original = sigmoid.(rec_original)
+    image = convert_to_image(rec_original, args.sample_size)
+    image_path = joinpath(args.save_path, "output.png")
+    save(image_path, image)
+    @info "Image saved: $(image_path)"
+    
+    _, _, rec_original2 = reconstuct(encoder, decoder, original2, device)
+    #rec_original2 = sigmoid.(rec_original2)
+    image = convert_to_image(rec_original2, args.sample_size)
+    image_path = joinpath(args.save_path, "output2.png")
+    save(image_path, image)
+    @info "Image saved: $(image_path)"
+     
+    loader3 = get_data2(1,filename,variablename) ## 1 is the batch size
+    #device = cpu
+    #BSON.@load "/lcldata/wuhao/RegAE_flux/RegAE_nz/output/model.bson" encoder decoder
+    encoder = cpu(encoder)
+    decoder = cpu(decoder)
+    tstM = ones(length(loader3), latent_dim)
+    i = 0
+    for (x,_) in loader3
+        μ, logσ = encoder(x)
+        i = i + 1
+        tstM[i,:] = μ
+    end
+
+    sigma = Statistics.cov(tstM; dims=1)
+    mu = vec(Statistics.mean(tstM; dims=1))
+
+    return encoder, decoder, highend, lowend, sigma, mu
 end
 
-function weights(nz, nh, numpixels; atype=Array{F})
-    θ = [  # z->x
-        xavier(nh, nz),
-        zeros(nh),
-        xavier(numpixels*numpixels, nh), #x
-        zeros(numpixels*numpixels)
-        ]
-    θ = map(a->convert(atype,a), θ)
+#if abspath(PROGRAM_FILE) == @__FILE__
+#    train()
+#end
 
-    ϕ = [ # x->z
-        xavier(nh, numpixels*numpixels),
-        zeros(nh),
-        xavier(nz, nh), #μ
-        zeros(nz),
-        xavier(nz, nh), #σ
-        zeros(nz)
-        ]
-    ϕ = map(a->convert(atype,a), ϕ)
+#train(100,1,100,500)
 
-    return θ, ϕ
-end
-
-function plot_dream(θ; gridsize=(5,5), scale=1.0)
-    nh, nz = size(θ[1])
-    atype = θ[1] isa KnetArray ? KnetArray : Array
-    m, n = gridsize
-    nimg = m*n
-    z = convert(atype, randn(F, nz, nimg))
-    x̂ = Array(decode(θ, z))
-    images = map(i->reshape(x̂[:,i], (numpixels,numpixels,1)), 1:nimg)
-    grid = make_image_grid(images; gridsize=gridsize, scale=scale)
-    display(colorview(Gray, grid))
-end
-
-function main(filename, variablename, args="")
-    s = ArgParseSettings()
-    s.description="Variational Auto Encoder on Geo dataset."
-    s.exc_handler=ArgParse.debug_handler
-    @add_arg_table s begin
-        ("--seed"; arg_type=Int; default=-1; help="random number seed: use a nonnegative int for repeatable results")
-        ("--batchsize"; arg_type=Int; default=100; help="minibatch size")
-        ("--epochs"; arg_type=Int; default=100; help="number of epochs for training")
-        ("--nh"; arg_type=Int; default=400; help="hidden layer dimension")
-        ("--nz"; arg_type=Int; default=40; help="encoding dimention")
-        ("--lr"; arg_type=Float64; default=1e-3; help="learning rate")
-        ("--atype"; default=(gpu()>=0 ? "KnetArray{F}" : "Array{F}"); help="array type: Array for cpu, KnetArray for gpu")
-        ("--infotime"; arg_type=Int; default=2; help="report every infotime epochs")
-    end
-    isa(args, String) && (args=split(args))
-    if in("--help", args) || in("-h", args)
-        ArgParse.show_help(s; exit_when_done=false)
-        return
-    end
-    o = parse_args(args, s; as_symbols=true)
-
-    atype = eval(Meta.parse(o[:atype]))
-    @info("using $atype")
-    o[:seed] > 0 && Knet.seed!(o[:seed])
-
-    xtrn, ytrn, xtst, ytst, highend, lowend = loaddata(filename, variablename)
-
-    θ, ϕ = weights(o[:nz], o[:nh], size(xtrn, 1), atype=atype)
-    w = [θ; ϕ]
-    opt = optimizers(w, Adam, lr=o[:lr])
-
-    report(epoch) = begin
-            dtrn = minibatch(xtrn, ytrn, o[:batchsize]; xtype=atype)
-            dtst = minibatch(xtst, ytst, o[:batchsize]; xtype=atype)
-            println((:epoch, epoch,
-                     :trn, aveloss(θ, ϕ, dtrn),
-                     :tst, aveloss(θ, ϕ, dtst)))
-    end
-
-    report(0)
-    @time for epoch=1:o[:epochs]
-        for (x, y) in  minibatch(xtrn, ytrn, o[:batchsize], shuffle=true, xtype=atype)
-            dw = grad(loss)(w, x, length(θ))
-            update!(w, dw, opt)
-        end
-        (epoch % o[:infotime] == 0) && report(epoch)
-    end
-
-    return θ, ϕ, highend, lowend
-end
+ 
